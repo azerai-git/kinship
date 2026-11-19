@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Popup dev</title>
+<link rel="stylesheet" href="../app.css"><link rel="stylesheet" href="../popup.css"></head>
+<body class="popup">
+  <!-- same markup as popup.html -->
+  <div id="signed-out" hidden><p>Sign in to send tabs to your Firefox devices.</p><button id="signin" class="primary">Sign in</button></div>
+  <div id="signed-in" hidden><h2>Send this tab to</h2><p id="tab-title" class="meta"></p><ul id="devices"></ul><p id="msg" class="meta" role="status"></p></div>
+  <hr><button id="open-app" class="link"></button>
+<script type="module">
+// Dev-only: stubs for popup.js. ?url= sets the current tab URL; ?signedout=1 removes the account.
+const params = new URLSearchParams(location.search);
+const { bytesToHex, randomBytes } = await import("../lib/crypto.js");
+const sendtab = await import("../lib/sendtab.js");
+const kSync = randomBytes(64), kid = "1700000000000-AAAAAAAAAAAAAAAAAAAAAA";
+const cmd = await sendtab.encryptKeysForCommand(await sendtab.generateKeys(), kSync, kid);
+const store = {
+  "cache:devices": [
+    { id: "me", name: "Edge on Windows", type: "desktop", isCurrentDevice: true, availableCommands: { [sendtab.COMMAND_SENDTAB]: cmd } },
+    { id: "fx1", name: "Firefox on Desktop", type: "desktop", availableCommands: { [sendtab.COMMAND_SENDTAB]: cmd } },
+    { id: "fx2", name: "Pixel", type: "mobile", availableCommands: { [sendtab.COMMAND_SENDTAB]: cmd } },
+    { id: "old", name: "Old laptop (no Send Tab)", type: "desktop", availableCommands: {} },
+  ],
+};
+if (!params.get("signedout")) store.account = { email: "dev@example", uid: "u", sessionToken: bytesToHex(randomBytes(32)), kSync: bytesToHex(kSync), kid };
+window.__invoked = [];
+const realFetch = fetch.bind(globalThis);
+globalThis.fetch = async (url, opts) => {
+  if (String(url).endsWith("/account/devices/invoke_command")) {
+    window.__invoked.push({ auth: opts.headers.Authorization.startsWith("Hawk "), body: JSON.parse(opts.body) });
+    return new Response(JSON.stringify({ enqueued: true, notified: true }), { status: 200 });
+  }
+  return realFetch(url, opts);
+};
+window.close = () => { window.__closed = true; };
+globalThis.chrome = {
+  storage: { local: { async get(k) { const o = {}; for (const x of [].concat(k)) if (x in store) o[x] = structuredClone(store[x]); return o; } } },
+  tabs: {
+    async query() { return [{ id: 7, url: params.get("url") || "https://example.com/article", title: "An article" }]; },
+    async create(o) { window.__opened = o.url; }, async update() {},
+  },
+  action: { async setBadgeText() {} },
+  runtime: { getURL: (p) => `chrome-extension://x/${p}`, async getContexts() { return []; } },
+};
+await import("../popup.js");
+</script></body></html>

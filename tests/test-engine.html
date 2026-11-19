@@ -1,0 +1,146 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Engine tests</title>
+<style>body{font:13px monospace;padding:16px} .pass{color:green} .fail{color:#c00;white-space:pre}</style></head>
+<body><h3>Sync engine / mirror tests (offline)</h3><div id="out"></div>
+<script type="module">
+// chrome.* stubs needed at import time
+const mem = {};
+const memStorage = { async get(k) { const ks = Array.isArray(k) ? k : [k]; const o = {}; for (const x of ks) if (x in mem) o[x] = structuredClone(mem[x]); return o; },
+  async set(o) { Object.assign(mem, structuredClone(o)); }, async remove(k) { for (const x of [].concat(k)) delete mem[x]; } };
+globalThis.chrome = { storage: { local: memStorage } };
+
+const mirror = await import("../lib/mirror.js");
+const engine = await import("../lib/engine.js");
+const { encryptPayload, decryptPayload, makeGuid } = await import("../lib/sync.js");
+const { randomBytes } = await import("../lib/crypto.js");
+const { fakeBookmarks } = await import("./fake-bookmarks.js");
+
+const out = document.getElementById("out");
+let pass = 0, fail = 0;
+function check(name, got, want) {
+  const g = JSON.stringify(got), w = JSON.stringify(want);
+  const ok = g === w;
+  ok ? pass++ : fail++;
+  const d = document.createElement("div");
+  d.className = ok ? "pass" : "fail";
+  d.textContent = `${ok ? "PASS" : "FAIL"} ${name}` + (ok ? "" : `\n   got:  ${g}\n   want: ${w}`);
+  out.append(d);
+}
+
+// ---- Fake chrome.bookmarks with Chrome's real move semantics ----
+const edge = () => fakeBookmarks([
+  { id: "1", title: "Favorites bar", folderType: "bookmarks-bar", children: [{ title: "E1", url: "https://e1/" }, { title: "E2", url: "https://e2/" }] },
+  { id: "2", title: "Other favorites", folderType: "other", children: [{ title: "E3", url: "https://e3/" }] },
+  { id: "3", title: "Mobile favorites", folderType: "mobile", children: [] },
+]);
+const R = (o) => Object.fromEntries(o.map((r) => [r.id, r]));
+const ff1 = () => R([
+  { id: "toolbar", type: "folder", children: ["A", "F1"] },
+  { id: "unfiled", type: "folder", children: ["D", "Q", "S"] },
+  { id: "menu", type: "folder", children: ["G"] },
+  { id: "mobile", type: "folder", children: ["H"] },
+  { id: "A", type: "bookmark", title: "A", bmkUri: "https://a/" },
+  { id: "F1", type: "folder", title: "F1", children: ["B", "C"] },
+  { id: "B", type: "bookmark", title: "B", bmkUri: "https://b/" },
+  { id: "C", type: "bookmark", title: "C", bmkUri: "https://c/" },
+  { id: "D", type: "bookmark", title: "D", bmkUri: "https://d/" },
+  { id: "Q", type: "query", title: "Q", bmkUri: "place:sort=8" },
+  { id: "S", type: "separator" },
+  { id: "G", type: "bookmark", title: "G", bmkUri: "https://g/" },
+  { id: "H", type: "bookmark", title: "H", bmkUri: "https://h/" },
+]);
+
+const api = edge();
+const opts = { uid: "u1", api, storage: memStorage };
+let s = await mirror.reconcile(ff1(), opts);
+check("first mirror: bar keeps Edge items first", api.titles("1"), ["E1", "E2", "A", "F1"]);
+check("first mirror: folder contents", api.titles(api.find("F1").id), ["B", "C"]);
+check("first mirror: other = Edge items, unfiled, menu folder", api.titles("2"), ["E3", "D", "Bookmarks Menu"]);
+check("first mirror: menu folder", api.titles(api.find("Bookmarks Menu").id), ["G"]);
+check("first mirror: mobile → mobile root", api.titles("3"), ["H"]);
+check("first mirror: created count (8, no query/separator)", s.created, 8);
+
+api.calls = 0;
+s = await mirror.reconcile(ff1(), opts);
+check("second run is a no-op (no writes)", { ...s, calls: api.calls }, { created: 0, updated: 0, moved: 0, removed: 0, calls: 0 });
+
+// Firefox-side changes: rename B, move C to toolbar front, delete D, reorder F1
+const ff2 = ff1();
+ff2.B.title = "B renamed";
+ff2.toolbar.children = ["C", "A", "F1"];
+ff2.F1.children = ["B"];
+ff2.unfiled.children = ["Q", "S"];
+delete ff2.D;
+// User deleted mirrored A in Edge; user added their own item into mirrored F1
+await api.removeTree(api.find("A").id);
+await api.create({ parentId: api.find("F1").id, title: "MINE", url: "https://mine/" });
+s = await mirror.reconcile(ff2, opts);
+check("changes: toolbar order (A recreated)", api.titles("1"), ["E1", "E2", "C", "A", "F1"]);
+check("changes: rename applied, user item kept last", api.titles(api.find("F1").id), ["B renamed", "MINE"]);
+check("changes: D removed, Edge item untouched", api.titles("2"), ["E3", "Bookmarks Menu"]);
+
+// Folder deleted in Firefox while its child moved elsewhere
+const ff3 = structuredClone(ff2);
+ff3.toolbar.children = ["C", "A"];
+ff3.unfiled.children = ["B"];
+delete ff3.F1;
+s = await mirror.reconcile(ff3, opts);
+check("folder delete + child moved out: toolbar", api.titles("1"), ["E1", "E2", "C", "A"]);
+check("folder delete + child moved out: B now in other", api.titles("2"), ["E3", "B renamed", "Bookmarks Menu"]);
+api.calls = 0;
+await mirror.reconcile(ff3, opts);
+check("stable after complex change", api.calls, 0);
+
+// Different account: no adoption of old nodes (they become the user's)
+s = await mirror.reconcile(ff3, { ...opts, uid: "u2" });
+check("account switch creates fresh mirror", s.created > 0, true);
+await mirror.removeAll(opts);
+check("removeAll: bar back to Edge-only + old-account copies", api.titles("1"), ["E1", "E2", "C", "A"]);
+
+// ---- tabs record ----
+const tabsRec = engine.buildTabsRecord("cid", "Edge on Windows", [
+  { url: "https://x/", title: "X", lastAccessed: 2000_000, favIconUrl: "https://x/f.ico", pinned: true },
+  { url: "chrome://settings", title: "S", lastAccessed: 3000_000 },
+  { url: "https://y/", title: "Y", lastAccessed: 5000_000, favIconUrl: "data:image/png;base64,AAA", incognito: true },
+  { url: "https://z/", title: "", lastAccessed: 4000_000, favIconUrl: "data:image/png;base64,AAA" },
+]);
+check("tabs record", tabsRec, { id: "cid", clientName: "Edge on Windows", tabs: [
+  { title: "https://z/", urlHistory: ["https://z/"], icon: null, lastUsed: 4000 },
+  { title: "X", urlHistory: ["https://x/"], icon: "https://x/f.ico", lastUsed: 2000, pinned: true },
+] });
+
+// ---- history merge ----
+const existing = { id: "hist1234abcd", histUri: "https://h/", title: "Old", visits: [{ date: 1700000000000000, type: 1 }] };
+const merged = engine.mergeHistoryRecord(existing, "https://h/", "New title", [
+  { visitTime: 1700000000000, transition: "link" },          // same as existing → dedup
+  { visitTime: 1700000500000.4, transition: "typed" },
+]);
+check("history merge keeps id, dedups, newest first", merged, { id: "hist1234abcd", histUri: "https://h/", title: "New title",
+  visits: [{ date: 1700000500000000, type: 2 }, { date: 1700000000000000, type: 1 }] });
+const fresh = engine.mergeHistoryRecord(undefined, "https://n/", "", [{ visitTime: 1, transition: "reload" }]);
+check("history new record gets 12-char guid", [fresh.id.length, fresh.visits[0].type], [12, 9]);
+const many = engine.mergeHistoryRecord(undefined, "https://m/", "", Array.from({ length: 30 }, (_, i) => ({ visitTime: i * 1000, transition: "link" })));
+check("history caps visits at 20", many.visits.length, 20);
+
+// ---- settings model + migration ----
+const N = engine.normalizeSettings;
+check("new install: nothing shared until setup", N({}, { hadSynced: false }),
+  { setupDone: false, bookmarksMode: "mirror", uploadTabs: false, uploadHistory: false, delivery: "push" });
+check("v0.3 user who never touched settings keeps everything on", N({}, { hadSynced: true }),
+  { setupDone: true, bookmarksMode: "mirror", uploadTabs: true, uploadHistory: true, delivery: "push" });
+check("v0.3 user who turned mirror + history off", N({ mirrorBookmarks: false, uploadHistory: false }, { hadSynced: true }),
+  { setupDone: true, bookmarksMode: "view", uploadTabs: true, uploadHistory: false, delivery: "push" });
+check("after sign-out (setupDone false) choices kept as defaults", N({ setupDone: false, bookmarksMode: "view", uploadTabs: true, delivery: "poll" }, { hadSynced: false }),
+  { setupDone: false, bookmarksMode: "view", uploadTabs: true, uploadHistory: false, delivery: "poll" });
+check("unimplemented/invalid modes fall back safely", N({ setupDone: true, bookmarksMode: "twoway", delivery: "carrier-pigeon" }),
+  { setupDone: true, bookmarksMode: "mirror", uploadTabs: false, uploadHistory: false, delivery: "push" });
+class OAuthError extends Error { constructor(s) { super("x"); this.status = s; } }
+check("auth errors detected (revoked refresh token / session)", [engine.isAuthError(new OAuthError(401)), engine.isAuthError({ errno: 110 }), engine.isAuthError({ status: 500 })], [true, true, false]);
+
+// ---- record encryption round trip ----
+const bundle = { enc: randomBytes(32), hmac: randomBytes(32) };
+const rec = { id: makeGuid(), clientName: "Ünï ✓", tabs: [] };
+check("encryptPayload ↔ decryptPayload", await decryptPayload(bundle, await encryptPayload(bundle, rec)), rec);
+
+document.title = fail ? `FAIL ${fail}/${pass + fail}` : `PASS ${pass}/${pass + fail}`;
+</script></body></html>

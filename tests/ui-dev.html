@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Kinship</title>
+  <link rel="stylesheet" href="../app.css">
+</head>
+<body>
+  <header>
+    <h1><img src="../icons/icon32.png" alt="" width="24" height="24"> Kinship <span class="subtitle">works with Firefox Sync</span></h1>
+    <div id="who" hidden><span id="who-email"></span> <button id="signout" class="link">Sign out</button></div>
+  </header>
+
+  <main>
+    <div id="reauth" class="banner" hidden>
+      <span>Your Mozilla account session ended, so syncing is paused.</span>
+      <button id="reauth-btn" class="primary">Sign in again</button>
+    </div>
+    <div id="status" role="status"></div>
+
+    <!-- Sign in -->
+    <section id="view-login" class="card" hidden>
+      <h2>Sign in with your Mozilla account</h2>
+      <p>Use the account you use for Firefox Sync. You'll sign in on Mozilla's own page
+        (accounts.firefox.com), in a new tab, including two-step authentication.
+        Kinship never sees your password.</p>
+      <div class="row">
+        <button id="signin" class="primary">Sign in with Mozilla</button>
+        <button id="cancel-signin" class="link" hidden>Cancel</button>
+      </div>
+      <p class="hint" id="client-note"></p>
+    </section>
+
+    <!-- First run: choose what to sync -->
+    <section id="view-setup" class="card" hidden>
+      <h2>Choose what to sync</h2>
+      <p class="disclosure">Everything is encrypted on this device with your account's Sync key
+        before it's uploaded, and goes only to Mozilla's servers, the same as Firefox.
+        Kinship has no servers of its own, and its developer never receives your data.</p>
+      <div id="setup-choices"></div>
+      <div class="row">
+        <button id="setup-start" class="primary">Start syncing</button>
+      </div>
+      <p class="hint">Your browser will ask permission for the options that need it. You can change these later in Settings.</p>
+    </section>
+
+    <!-- Signed in -->
+    <section id="view-main" hidden>
+      <nav class="tabs" role="tablist">
+        <button data-tab="bookmarks" class="active">Bookmarks</button>
+        <button data-tab="history">History</button>
+        <button data-tab="tabs">Synced tabs</button>
+        <button data-tab="devices">Devices</button>
+        <button data-tab="settings">Settings</button>
+        <button data-tab="raw">Sync status</button>
+      </nav>
+      <div class="toolbar">
+        <input id="filter" type="search" placeholder="Filter…">
+        <span id="sync-info" class="meta"></span>
+        <button id="sync-now" class="secondary">Sync now</button>
+      </div>
+      <div id="content" class="card"></div>
+    </section>
+  </main>
+
+  <footer class="hint">Kinship is an independent project, not affiliated with or endorsed by Mozilla.
+    Firefox is a trademark of the Mozilla Foundation.</footer>
+
+  <script type="module" src="ui-stub.js"></script><script type="module" src="../app.js"></script>
+</body>
+</html>

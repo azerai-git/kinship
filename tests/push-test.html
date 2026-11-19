@@ -1,0 +1,45 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Push test</title>
+<style>body{font:13px monospace;padding:16px;white-space:pre-wrap} .err{color:#c00} .ok{color:green}</style></head>
+<body><h3>Autopush connectivity test (no account needed)</h3><div id="log"></div>
+<script type="module">
+import { PushClient } from "../lib/push.js";
+import * as webpush from "../lib/webpush.js";
+import { b64ToBytes, utf8 } from "../lib/crypto.js";
+const log = (m, c = "") => { const d = document.createElement("div"); d.className = c; d.textContent = m; document.getElementById("log").append(d); };
+const mem = {};
+const storage = { async get(k) { return k in mem ? { [k]: mem[k] } : {}; }, async set(o) { Object.assign(mem, structuredClone(o)); }, async remove(k) { delete mem[k]; } };
+let resolveMsg; const gotMsg = new Promise((r) => (resolveMsg = r));
+let resolveSub; const gotSub = new Promise((r) => (resolveSub = r));
+const client = new PushClient({
+  storage,
+  onStatus: (s) => log("status: " + s),
+  onSubscription: (s) => { log(`OK   subscribed; endpoint host ${new URL(s.endpoint).host}`, "ok"); resolveSub(s); },
+  onMessage: (m) => { log(`OK   push received + decrypted: ${JSON.stringify(m)}`, "ok"); resolveMsg(m); },
+});
+window.client = client;
+await client.start();
+const sub = await Promise.race([gotSub, new Promise((_, rej) => setTimeout(() => rej(new Error("no subscription in 20s")), 20000))])
+  .catch((e) => { log("FAIL " + e.message, "err"); throw e; });
+// Send ourselves a Web Push message exactly like a push sender (FxA) would.
+const body = await webpush.encrypt(utf8(JSON.stringify({ version: 1, command: "test", data: { hello: "world" } })),
+  b64ToBytes(sub.publicKey), b64ToBytes(sub.authSecret));
+const t0 = performance.now();
+const r = await fetch(`/proxy?url=${encodeURIComponent(sub.endpoint)}`, {
+  method: "POST", body, headers: { "Content-Type": "application/octet-stream", "TTL": "60", "X-Content-Encoding": "aes128gcm" },
+});
+log(`     POST endpoint -> HTTP ${r.status} ${r.status >= 300 ? await r.text() : ""}`, r.ok ? "" : "err");
+await Promise.race([gotMsg, new Promise((_, rej) => setTimeout(() => rej(new Error("no push within 15s")), 15000))])
+  .then(() => log(`OK   delivered in ${Math.round(performance.now() - t0)} ms`, "ok"))
+  .catch((e) => log("FAIL " + e.message, "err"));
+// Reconnect with saved UAID: channel must survive.
+const ep1 = sub.endpoint;
+client.stop(); await new Promise((r) => setTimeout(r, 500));
+let resolveSub2; const gotSub2 = new Promise((r) => (resolveSub2 = r));
+client.onSubscription = (s) => resolveSub2(s);
+await client.start();
+const sub2 = await Promise.race([gotSub2, new Promise((r) => setTimeout(() => r(null), 15000))]);
+log(sub2?.endpoint === ep1 ? "OK   reconnect kept the same endpoint (UAID resumed)" : `FAIL endpoint changed on reconnect: ${!!sub2}`, sub2?.endpoint === ep1 ? "ok" : "err");
+client.stop();
+document.title = "done";
+</script></body></html>

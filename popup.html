@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Send tab</title>
+  <link rel="stylesheet" href="app.css">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body class="popup">
+  <div id="signed-out" hidden>
+    <p>Sign in to send tabs to your Firefox devices.</p>
+    <button id="signin" class="primary">Sign in</button>
+  </div>
+  <div id="signed-in" hidden>
+    <h2>Send this tab to</h2>
+    <p id="tab-title" class="meta"></p>
+    <ul id="devices"></ul>
+    <p id="msg" class="meta" role="status"></p>
+  </div>
+  <hr>
+  <button id="open-app" class="link"></button>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

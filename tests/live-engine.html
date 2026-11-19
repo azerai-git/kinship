@@ -1,0 +1,125 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Engine live harness</title>
+<style>body{font:13px monospace;padding:16px;white-space:pre-wrap} .err{color:#c00} .ok{color:green}</style></head>
+<body><h3>Firefox Sync PoC — push + sync engine live harness (dev only)</h3><div id="log"></div>
+<script type="module">
+// Runs the real lib/ code (engine, push, device, mirror) against the live
+// servers. chrome.* is stubbed: bookmarks go to a FAKE in-memory tree, tabs and
+// history are a single test entry. Logs only counts/status, never contents.
+const realFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = (url, opts) => {
+  const s = String(url);
+  if (/^https:\/\/([a-z0-9-]+\.)*(accounts\.firefox\.com|services\.mozilla\.com)\//.test(s)) return realFetch(`/proxy?url=${encodeURIComponent(s)}`, opts);
+  return realFetch(url, opts);
+};
+const mem = {};
+const storage = {
+  async get(k) { const ks = Array.isArray(k) ? k : [k]; const o = {}; for (const x of ks) if (x in mem) o[x] = structuredClone(mem[x]); return o; },
+  async set(o) { Object.assign(mem, structuredClone(o)); }, async remove(k) { for (const x of [].concat(k)) delete mem[x]; },
+};
+const { fakeBookmarks } = await import("./fake-bookmarks.js");
+const fakeBm = fakeBookmarks([
+  { id: "1", title: "Favorites bar", folderType: "bookmarks-bar", children: [{ title: "Edge own", url: "https://edge.example/" }] },
+  { id: "2", title: "Other favorites", folderType: "other", children: [] },
+  { id: "3", title: "Mobile favorites", folderType: "mobile", children: [] },
+]);
+const TEST_URL = `https://example.com/?ffsync-poc-harness=${Date.now()}`;
+globalThis.chrome = {
+  storage: { local: storage },
+  bookmarks: fakeBm,
+  tabs: { async query() { return [{ url: TEST_URL, title: "FFSync PoC harness test tab", lastAccessed: Date.now() }]; } },
+  history: {
+    async search() { return [{ url: TEST_URL, title: "FFSync PoC harness test page" }]; },
+    async getVisits({ url }) { return url === TEST_URL ? [{ visitTime: Date.now(), transition: "typed", isLocal: true }] : []; },
+  },
+};
+const oauth = await import("../lib/oauth.js");
+const fxa = await import("../lib/fxa.js");
+const account = await import("../lib/account.js");
+const device = await import("../lib/device.js");
+const engine = await import("../lib/engine.js");
+const { PushClient } = await import("../lib/push.js");
+
+const logEl = document.getElementById("log");
+const log = (m, c = "") => { const d = document.createElement("div"); d.className = c; d.textContent = m; logEl.append(d); console.log(m); };
+const errText = (e) => `${e.name}: ${e.message}` + (e.status ? ` [HTTP ${e.status}]` : "") + (e.errno ? ` [errno ${e.errno}]` : "") + (e.body ? ` body=${JSON.stringify(e.body).slice(0, 300)}` : "");
+async function step(name, fn) {
+  const t0 = performance.now();
+  try { const r = await fn(); log(`OK   ${name} (${Math.round(performance.now() - t0)} ms)`, "ok"); return r; }
+  catch (e) { log(`FAIL ${name}: ${errText(e)}`, "err"); console.error(e); throw e; }
+}
+const waitFor = (pred, ms) => new Promise((res) => { const t0 = Date.now(); const i = setInterval(() => { const v = pred(); if (v || Date.now() - t0 > ms) { clearInterval(i); res(v); } }, 50); });
+
+let flow, acct, push;
+const pushes = [];
+window.start = async () => { flow = await oauth.beginFlow(); log("flow started"); return flow.url; };
+
+window.finish = async (redirectUrl) => {
+  const code = oauth.parseRedirect(flow, redirectUrl);
+  acct = await step("sign-in", async () => account.completeLogin(await oauth.completeFlow(flow, code)));
+  return window.run();
+};
+
+window.run = async () => {
+  // --- push subscription + device ---
+  let sub = null;
+  push = new PushClient({ storage, onStatus: (s) => log(`     push: ${s}`), onSubscription: (s) => { sub = s; },
+    onMessage: (m) => { pushes.push({ at: Date.now(), m }); log(`     push message: ${m?.command} ${JSON.stringify(m?.data ? Object.keys(m.data) : [])}`); } });
+  await push.start();
+  await step("push subscription", async () => { if (!(await waitFor(() => sub, 15000))) throw new Error("no endpoint"); });
+  const me = await step("register device with pushCallback", () => device.ensureDevice(acct, { name: "Sync test (harness)", push: sub }));
+  const listed = (await fxa.getDevices(acct.sessionToken)).find((d) => d.isCurrentDevice);
+  log(`     server has our pushCallback: ${listed?.pushCallback === sub.endpoint}; pushEndpointExpired: ${listed?.pushEndpointExpired}`);
+
+  // --- Send Tab to self via push ---
+  const n0 = pushes.length, t0 = Date.now();
+  await step("send tab to self", () => device.sendTab(acct, me.id, { title: "push test", url: "https://example.com/push-test" }));
+  const got = await waitFor(() => pushes.slice(n0).find((p) => p.m?.command === "fxaccounts:command_received"), 15000);
+  log(got ? `OK   command_received push arrived after ${got.at - t0} ms` : "FAIL no command_received push within 15 s", got ? "ok" : "err");
+  const tabs = await step("poll received tabs", () => device.pollReceivedTabs(acct));
+  log(`     received ${tabs.length} tab(s)`);
+
+  // --- notifyDevices to self (sync:collection_changed) ---
+  const n1 = pushes.length, t1 = Date.now();
+  await step("notifyDevices(sync:collection_changed) to self", () => fxa.notifyDevices(acct, { to: [me.id], TTL: 0,
+    payload: { version: 1, command: "sync:collection_changed", data: { collections: ["tabs"], reason: "test" } } }));
+  const got2 = await waitFor(() => pushes.slice(n1).find((p) => p.m?.command === "sync:collection_changed"), 15000);
+  log(got2 ? `OK   collection_changed push arrived after ${got2.at - t1} ms` : "FAIL no collection_changed push within 15 s", got2 ? "ok" : "err");
+
+  // --- full first sync (downloads, uploads, mirror into FAKE bookmarks) ---
+  const summary = await step("engine first sync", () => engine.sync({ reason: "manual" }));
+  log(`     downloaded: ${JSON.stringify(summary.downloaded)}`);
+  log(`     uploaded:   ${JSON.stringify(summary.uploaded)}`);
+  log(`     mirror:     ${JSON.stringify(summary.mirror)}`);
+  const st = await engine.loadState();
+  log(`     engines: ${Object.keys(st.meta?.engines || {}).sort().join(",")}; declined: ${JSON.stringify(st.meta?.declined)}`);
+  const counts = {};
+  for (const c of engine.COLLECTIONS) counts[c] = Object.keys(await engine.loadCache(c)).length;
+  log(`     cache counts: ${JSON.stringify(counts)}`);
+  const ourTabs = (await engine.loadCache("tabs"))[st.clientId];
+  const ourClient = (await engine.loadCache("clients"))[st.clientId];
+  log(`     our records visible after re-download? tabs: ${!!ourTabs}, clients: ${!!ourClient}`);
+  log(`     fake Edge bar: ${fakeBm.titles("1").length} items (first is Edge's own: ${fakeBm.titles("1")[0] === "Edge own"})`);
+
+  // --- incremental: second sync should download (almost) nothing and write no bookmarks ---
+  fakeBm.calls = 0;
+  const s2 = await step("engine second sync (incremental)", () => engine.sync({ reason: "schedule" }));
+  log(`     downloaded: ${JSON.stringify(s2.downloaded)}; bookmark writes: ${fakeBm.calls}`);
+  log("done.");
+};
+
+window.cleanup = async () => {
+  const st = await engine.loadState();
+  const client = await account.getSyncClient(acct);
+  for (const coll of ["tabs", "clients"]) await step(`delete our ${coll} record`, () => client.deleteRecord(coll, st.clientId)).catch(() => {});
+  const hist = Object.values(await engine.loadCache("history")).find((r) => r.histUri === TEST_URL);
+  if (hist) await step("tombstone the test history entry", () => client.postRecords("history", [{ id: hist.id, deleted: true }], { ttl: engine.HISTORY_TTL })).catch(() => {});
+  else log("     (test history entry not found in cache)");
+  push?.stop();
+  await step("sign out (device destroy + token revoke)", () => account.clearAccount()).catch(() => {});
+  const rt = await oauth.refreshAccessToken(acct.refreshToken).then(() => "STILL VALID", (e) => `revoked (HTTP ${e.status})`);
+  log(`     refresh token now: ${rt}`, rt === "STILL VALID" ? "err" : "ok");
+};
+
+log("ready. call start()");
+</script></body></html>
